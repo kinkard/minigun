@@ -149,12 +149,25 @@ async fn run(
     }
 
     let requests: Arc<[HttpRequest]> = Arc::from(requests);
-    let additional_headers: Arc<[String]> = Arc::from(additional_headers);
 
-    let client = reqwest::Client::new();
+    let additional_headers = additional_headers
+        .into_iter()
+        .filter_map(|h| {
+            h.split_once(':').and_then(|(k, v)| {
+                Some((
+                    HeaderName::from_str(k.trim()).ok()?,
+                    HeaderValue::from_str(v.trim()).ok()?,
+                ))
+            })
+        })
+        .collect();
+    let client = reqwest::ClientBuilder::new()
+        .default_headers(additional_headers)
+        .build()
+        .expect("Client::new()");
 
     // Try to send a single request to check if the server is up
-    let _ = send_request(&client, &url, &requests[0], &additional_headers)
+    let _ = send_request(&client, &url, &requests[0])
         .await
         .expect("Failed to send a test request");
 
@@ -173,7 +186,6 @@ async fn run(
         for task_idx in tasks.len()..concurrency {
             let client = client.clone();
             let url = url.clone();
-            let additional_headers = additional_headers.clone();
             let requests = requests.clone();
             let results_tx = results_tx.clone();
 
@@ -186,7 +198,7 @@ async fn run(
                     .step_by(max_concurrency);
                 for r in requests {
                     let start = std::time::Instant::now();
-                    let result = send_request(&client, &url, r, &additional_headers).await;
+                    let result = send_request(&client, &url, r).await;
 
                     let elapsed_us = start.elapsed().as_micros();
                     let latency = if result.is_ok_and(|r| r.status().is_success()) {
@@ -297,7 +309,6 @@ async fn send_request(
     client: &reqwest::Client,
     base_url: &str,
     request: &HttpRequest,
-    additional_headers: &[String],
 ) -> Result<reqwest::Response, reqwest::Error> {
     let method = match request.method {
         HttpMethod::Get => Method::GET,
@@ -317,7 +328,6 @@ async fn send_request(
                 .headers
                 .iter()
                 .map(|s| s.as_ref())
-                .chain(additional_headers.iter().map(String::as_str))
                 .filter_map(|h| {
                     h.split_once(':').and_then(|(k, v)| {
                         Some((
