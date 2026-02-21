@@ -1,6 +1,6 @@
-# About
+# Minigun
 
-This project is a simple tool to measure the latency and throughput of Valhalla routing engine.
+A minimalistic HTTP load testing tool that replays real-world traffic from pcap files. Originally developed to test Valhalla and OSRM routing engines, but works with any HTTP service.
 
 ## Build & Run
 
@@ -10,30 +10,38 @@ cargo run --release -- --help
 
 ## Playbook
 
-If external IP address is `192.168.0.1` and port is `8002` (default Valhalla port), then
+Capture HTTP requests to your service (replace `192.168.0.1` and `8002` with your target):
 
 ```sh
-sudo tcpdump -i any dst host 192.168.0.1 and dst port 8002 -w valhalla.pcap
+sudo tcpdump -i any dst host 192.168.0.1 and dst port 8002 -w service.pcap
 ```
 
-alternatively, filtering by network interface (see all via `ip a`) can be done
+Alternative approaches:
+
+- Filter by network interface: `sudo tcpdump -i eth0 dst port 8002 -w service.pcap`
+- Capture all traffic to port: `sudo tcpdump -i any dst port 8002 -w service.pcap`
+
+Convert the pcap file to a compact playbook format:
 
 ```sh
-sudo tcpdump -i eth0 dst port 8002 -w valhalla.pcap
+cargo run --release -- extract service.pcap -o service.playbook
 ```
 
-Note: Filtering by IP address can be skipped, but without it every packet will be captured 3 times if Valhalla is running in Docker:packet to the host, to the bridge and to the container.
+Filter for specific endpoints:
+```sh
+cargo run --release -- extract service.pcap -o service.playbook --filter "/api/"
+```
 
-Then this tcpdump should be converted into a playbook (reducing the size of it in 10..100 times...)
+The resulting playbook can be inspected with
 
 ```sh
-cargo run --release -- extract valhalla.pcap -o valhalla.playbook
+cat service.playbook | capnp convert packed:json schema/playbook.capnp HttpRequest
 ```
 
 And finally the playbook can be used to measure the latency and throughput
 
 ```sh
-cargo run --release -- run http://localhost:8002 valhalla.playbook
+cargo run --release -- run http://localhost:8002 service.playbook
 ```
 
 ## License

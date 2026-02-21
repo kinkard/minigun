@@ -25,6 +25,6 @@ jobs:
         with:
           platforms: linux/arm64,linux/amd64
           push: true
-          tags: kinkard/valhalla-gatling:latest
+          tags: kinkard/minigun:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
