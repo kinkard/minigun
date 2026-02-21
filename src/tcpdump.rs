@@ -226,6 +226,7 @@ fn parse_http_header(data: &[u8]) -> Option<(HttpHeader, usize)> {
         let value = value.trim();
         match key {
             "Host" | "Connection" => (), // ignore as any HTTP client will override them anyway
+            "Traceparent" | "Tracestate" | "Baggage" => (), // trace headers should be ignored
             "Content-Length" => {
                 let Ok(length) = value.parse::<usize>() else {
                     println!("Invalid Content-Length: {}", value);
