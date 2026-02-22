@@ -137,35 +137,43 @@ struct TcpPacket<'a> {
 /// Reads a TCP packet from raw packet data, given the linktype.
 /// Skips non-TCP packets and TCP packets with no payload.
 fn read_tcp_packet(data: &[u8], linktype: Linktype) -> Option<TcpPacket<'_>> {
-    let ip_packet = match linktype {
-        Linktype::ETHERNET => {
-            assert_eq!(u16::from_be_bytes([data[12], data[13]]), 0x0800);
-            &data[14..]
-        }
-        Linktype::LINUX_SLL2 => {
-            assert_eq!(u16::from_be_bytes([data[0], data[1]]), 0x0800);
-            &data[20..]
-        }
+    // 14 bytes Ethernet header + 20 bytes IPv4 header + 20 bytes TCP header = 54 bytes
+    // minimum for a TCP packet with payload
+    if data.len() < 14 + 20 + 20 {
+        return None;
+    }
+
+    let (ip_packet, ether_type) = match linktype {
+        Linktype::ETHERNET => (&data[14..], u16::from_be_bytes([data[12], data[13]])),
+        Linktype::LINUX_SLL2 => (&data[20..], u16::from_be_bytes([data[0], data[1]])),
         _ => {
             todo!("Unsupported linktype: {linktype:?}");
         }
     };
 
-    // https://en.wikipedia.org/wiki/IPv4#Header
-    let ip_version_and_ihl = ip_packet[0];
-    let version = ip_version_and_ihl >> 4;
-    if version != 4 {
-        println!("Not an IPv4 packet (Version: {}).", version);
-        return None; // todo: Support IPv6
-    }
-    let ip_protocol = ip_packet[9];
-    if ip_protocol != 6 {
-        println!("Not a TCP packet (Protocol: {ip_protocol}).");
+    let (tcp_packet, protocol) = match ether_type {
+        0x0800 => {
+            // https://en.wikipedia.org/wiki/IPv4#Header
+            let ip_version_and_ihl = ip_packet[0];
+            let version = ip_version_and_ihl >> 4;
+            if version != 4 {
+                println!("Not an IPv4 packet (Version: {}).", version);
+                return None;
+            }
+            let ihl = (ip_version_and_ihl & 0x0f) as usize * 4;
+            (&ip_packet[ihl..], ip_packet[9])
+        }
+        // todo: Support IPv6 with EtherType 0x86dd
+        _ => {
+            println!("Unsupported EtherType: {ether_type:#06x}.");
+            return None;
+        }
+    };
+
+    if protocol != 6 {
+        println!("Not a TCP packet (Protocol: {protocol}).");
         return None;
     }
-
-    let ihl = (ip_version_and_ihl & 0x0f) as usize * 4;
-    let tcp_packet = &ip_packet[ihl..];
 
     // https://en.wikipedia.org/wiki/Transmission_Control_Protocol#TCP_segment_structure
     let data_offset = (tcp_packet[12] >> 4) as usize * 4;
