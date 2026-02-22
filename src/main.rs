@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use reqwest::Method;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -29,13 +29,14 @@ enum Commands {
     /// Extracts HTTP requests from a .pcap file and saves them in a .playbook file.
     Extract {
         /// Path to the .pcap file(s) to extract the HTTP requests from, usually captured via `tcpdump`.
-        #[arg(required = true)]
+        /// Reads stdin if no file is provided.
         tcpdump: Vec<String>,
         /// Optional filter to only include requests whose URL contains the specified string.
         /// For example, `--filter "/route"` will only include requests to the `/route` endpoint.
         #[arg(short, long)]
         filter: Option<String>,
-        /// Optional output file name. If not provided, the default name is equal to the input file name with the `.playbook` extension.
+        /// Optional output file name. If not provided, the default name is equal to the input file
+        /// name with the `.playbook` extension.
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -76,41 +77,49 @@ fn main() {
 }
 
 fn extract(tcpdumps: Vec<String>, filter: Option<String>, output: Option<String>) {
-    let output = output.unwrap_or_else(|| format!("{}.playbook", tcpdumps[0]));
-    let mut requests = Vec::new();
+    let output = output.unwrap_or_else(|| {
+        if tcpdumps.is_empty() || (tcpdumps.len() == 1 && tcpdumps[0] == "-") {
+            "capture.playbook".to_string()
+        } else {
+            format!("{}.playbook", tcpdumps[0])
+        }
+    });
 
-    for tcpdump in tcpdumps {
-        println!("Parsing {tcpdump}...");
+    let file = File::create(&output).expect("Failed to create capnp file");
+    let mut writer = BufWriter::new(file);
+    let mut request_count = 0;
 
-        let reader = tcpdump::TcpDumpReader::new(&tcpdump).expect("Failed to open tcpdump file");
-        let mut total = 0;
+    if tcpdumps.is_empty() || (tcpdumps.len() == 1 && tcpdumps[0] == "-") {
+        // UNIX convention to read from stdin if no file is provided:
+        // `cat file.pcap | minigun extract --filter "/route" -o route.playbook`
+        // `tcpdump -i any -w - | minigun extract --filter "/route" -o route.playbook`
+        println!("Reading tcpdump from stdin...");
+        let stdin = std::io::stdin();
+        let reader = tcpdump::TcpDumpReader::new(stdin).expect("Failed to read tcpdump from stdin");
         for request in reader {
             if filter.as_ref().is_none_or(|f| request.uri.contains(f)) {
-                requests.push(request);
+                write_request(&request, &mut writer)
+                    .expect("Failed to write capnp message to the playbook");
+                request_count += 1;
             }
-            total += 1;
         }
-
-        println!("Parsed {total} HTTP requests from {tcpdump}");
-    }
-    println!("Total requests extracted: {}", requests.len());
-
-    let file = File::create(output).expect("Failed to create capnp file");
-    let mut writer = BufWriter::new(file);
-
-    for r in requests {
-        let mut message = capnp::message::Builder::new_default();
-        let mut request_builder = message.init_root::<playbook_capnp::http_request::Builder>();
-        request_builder.set_method(r.method);
-        request_builder.set_uri(&r.uri);
-        request_builder.set_body(&r.body);
-        request_builder.set_headers(r.headers.as_ref()).unwrap();
-
-        capnp::serialize_packed::write_message(&mut writer, &message)
-            .expect("Failed to write capnp message to the playbook");
+    } else {
+        for tcpdump in tcpdumps {
+            println!("Reading tcpdump file {tcpdump}...");
+            let file = File::open(&tcpdump).expect("Failed to open tcpdump file");
+            let reader = tcpdump::TcpDumpReader::new(file).expect("Failed to read tcpdump file");
+            for request in reader {
+                if filter.as_ref().is_none_or(|f| request.uri.contains(f)) {
+                    write_request(&request, &mut writer)
+                        .expect("Failed to write capnp message to the playbook");
+                    request_count += 1;
+                }
+            }
+        }
     }
 
     writer.flush().expect("Failed to flush playbook file");
+    println!("Total requests extracted: {}", request_count);
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
@@ -120,34 +129,12 @@ async fn run(
     max_concurrency: usize,
     additional_headers: Vec<String>,
 ) {
+    let mut requests = Vec::new();
     let mut file = File::open(playbook).expect("Failed to open playbook file");
     let mut reader = std::io::BufReader::new(&mut file);
-    let mut requests = Vec::new();
-    while let Ok(message) = capnp::serialize_packed::read_message(&mut reader, Default::default()) {
-        let root = message
-            .get_root::<playbook_capnp::http_request::Reader>()
-            .expect("Bad file format - no `HttpRequest`");
-
-        let request = HttpRequest {
-            method: root.get_method().expect("Bad file format - no `method`"),
-            uri: root
-                .get_uri()
-                .expect("Bad file format - no `uri`")
-                .to_string()
-                .unwrap()
-                .into(),
-            headers: root
-                .get_headers()
-                .expect("Bad file format - no `headers`")
-                .iter()
-                .map(|h| h.unwrap().to_string().unwrap().into())
-                .collect(),
-            body: root.get_body().expect("Bad file format - no `body`").into(),
-        };
-
+    while let Ok(request) = read_request(&mut reader) {
         requests.push(request);
     }
-
     let requests: Arc<[HttpRequest]> = Arc::from(requests);
 
     let additional_headers = additional_headers
@@ -305,6 +292,48 @@ async fn run(
     }
 }
 
+fn read_request(reader: &mut impl std::io::BufRead) -> Result<HttpRequest> {
+    let message = capnp::serialize_packed::read_message(reader, Default::default())?;
+    let root = message
+        .get_root::<playbook_capnp::http_request::Reader>()
+        .context("Bad file format - no `HttpRequest`")?;
+
+    Ok(HttpRequest {
+        method: root.get_method().expect("Bad file format - no `method`"),
+        uri: root
+            .get_uri()
+            .context("Bad file format - no `uri`")?
+            .to_string()?
+            .into(),
+        headers: root
+            .get_headers()
+            .context("Bad file format - no `headers`")?
+            .iter()
+            .map(|h| h.unwrap().to_string().unwrap().into())
+            .collect(),
+        body: root
+            .get_body()
+            .context("Bad file format - no `body`")?
+            .into(),
+    })
+}
+
+fn write_request(request: &HttpRequest, mut writer: impl Write) -> Result<()> {
+    let mut message = capnp::message::Builder::new_default();
+    let mut request_builder = message.init_root::<playbook_capnp::http_request::Builder>();
+    request_builder.set_method(request.method);
+    request_builder.set_uri(&request.uri);
+    request_builder.set_body(&request.body);
+    request_builder
+        .set_headers(request.headers.as_ref())
+        .unwrap();
+
+    Ok(capnp::serialize_packed::write_message(
+        &mut writer,
+        &message,
+    )?)
+}
+
 async fn send_request(
     client: &reqwest::Client,
     base_url: &str,
@@ -351,4 +380,43 @@ struct Metric {
     p50: f64,
     p95: f64,
     p99: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_write_request() {
+        let requests = vec![
+            HttpRequest {
+                method: HttpMethod::Get,
+                uri: "/test1".into(),
+                headers: vec!["Accept:text/plain".into()].into(),
+                body: Vec::new().into(),
+            },
+            HttpRequest {
+                method: HttpMethod::Put,
+                uri: "/test2".into(),
+                headers: vec!["Content-Type:application/json".into()].into(),
+                body: b"{\"key\":\"value\"}".to_vec().into(),
+            },
+        ];
+
+        let mut buffer = Vec::new();
+        for request in &requests {
+            write_request(request, &mut buffer).expect("Failed to write request");
+        }
+
+        let mut reader = std::io::BufReader::new(buffer.as_slice());
+        for original_request in &requests {
+            let deserialized_request =
+                read_request(&mut reader).expect("Failed to read request from buffer");
+
+            assert_eq!(original_request.method, deserialized_request.method);
+            assert_eq!(original_request.uri, deserialized_request.uri);
+            assert_eq!(original_request.headers, deserialized_request.headers);
+            assert_eq!(original_request.body, deserialized_request.body);
+        }
+    }
 }

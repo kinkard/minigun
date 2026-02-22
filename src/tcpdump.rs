@@ -1,5 +1,3 @@
-use std::fs::File;
-
 use anyhow::{Context, Result};
 use pcap_parser::{
     LegacyPcapReader, Linktype, PcapBlockOwned, PcapError, traits::PcapReaderIterator,
@@ -23,8 +21,8 @@ pub struct HttpRequest {
 }
 
 /// An iterator over HTTP requests in a pcap file.
-pub struct TcpDumpReader {
-    pcap_reader: LegacyPcapReader<File>,
+pub struct TcpDumpReader<R: std::io::Read> {
+    pcap_reader: LegacyPcapReader<R>,
     /// An offset to consume from the inner reader.
     offset: usize,
     /// The linktype of the pcap file.
@@ -33,10 +31,12 @@ pub struct TcpDumpReader {
     pending_requests: FxHashMap<(u16, u32), (HttpHeader, Vec<u8>)>,
 }
 
-impl TcpDumpReader {
-    pub fn new(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let file = File::open(path).context("Failed to open pcap file")?;
-        let mut reader = LegacyPcapReader::new(65536, file).context("Failed to read pcap file")?;
+impl<R: std::io::Read> TcpDumpReader<R> {
+    pub fn new(reader: R) -> Result<Self> {
+        // pcap_parser::create_reader(65536, reader);
+
+        let mut reader =
+            LegacyPcapReader::new(65536, reader).context("Failed to create pcap reader")?;
 
         // Pcap starts with a global header, so we need to consume it first to resolve the linktype
         let Ok((offset, PcapBlockOwned::LegacyHeader(header))) = reader.next() else {
@@ -52,7 +52,7 @@ impl TcpDumpReader {
     }
 }
 
-impl Iterator for TcpDumpReader {
+impl<R: std::io::Read> Iterator for TcpDumpReader<R> {
     type Item = HttpRequest;
 
     fn next(&mut self) -> Option<Self::Item> {
