@@ -19,5 +19,5 @@ RUN touch -a -m ./src/main.rs
 RUN cargo build --release
 
 FROM alpine AS runtime
+RUN apk add --no-cache tcpdump # To support unsing this image as a debug image in k8s
 COPY --from=builder /usr/src/app/target/release/minigun /usr/local/bin/minigun
-CMD ["minigun"]
