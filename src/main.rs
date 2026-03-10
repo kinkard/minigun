@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use reqwest::Method;
 use reqwest::header::{HeaderName, HeaderValue};
+use rustc_hash::FxHashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -88,6 +89,7 @@ fn extract(tcpdumps: Vec<String>, filter: Option<String>, output: Option<String>
     let file = File::create(&output).expect("Failed to create capnp file");
     let mut writer = BufWriter::new(file);
     let mut request_count = 0;
+    let mut request_per_uri = FxHashMap::default();
 
     if tcpdumps.is_empty() || (tcpdumps.len() == 1 && tcpdumps[0] == "-") {
         // UNIX convention to read from stdin if no file is provided:
@@ -101,6 +103,10 @@ fn extract(tcpdumps: Vec<String>, filter: Option<String>, output: Option<String>
                 write_request(&request, &mut writer)
                     .expect("Failed to write capnp message to the playbook");
                 request_count += 1;
+                request_per_uri
+                    .entry(request.uri)
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
             }
         }
     } else {
@@ -113,13 +119,21 @@ fn extract(tcpdumps: Vec<String>, filter: Option<String>, output: Option<String>
                     write_request(&request, &mut writer)
                         .expect("Failed to write capnp message to the playbook");
                     request_count += 1;
+                    request_per_uri
+                        .entry(request.uri)
+                        .and_modify(|c| *c += 1)
+                        .or_insert(1);
                 }
             }
         }
     }
 
     writer.flush().expect("Failed to flush playbook file");
+
     println!("Total requests extracted: {}", request_count);
+    for (uri, count) in request_per_uri {
+        println!("{}: {}", uri, count);
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
