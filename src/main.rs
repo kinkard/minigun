@@ -58,6 +58,9 @@ enum Commands {
         /// Number of requests to skip from the beginning of the playbook.
         #[arg(short, long, default_value = "0")]
         skip: usize,
+        /// Number of concurrent requests to send.
+        #[arg(short, long, default_value = "1")]
+        concurrency: usize,
     },
 
     /// Sends the requests to the specified URL and measures the throughput, success rate and latency percentiles.
@@ -91,7 +94,8 @@ fn main() {
             playbook,
             header,
             skip,
-        } => probe(url, playbook, header, skip),
+            concurrency,
+        } => probe(url, playbook, header, skip, concurrency),
         Commands::Run {
             url,
             playbook,
@@ -160,77 +164,223 @@ fn extract(tcpdumps: Vec<String>, filter: Option<String>, output: Option<String>
     }
 }
 
-fn probe(url: String, playbook: PathBuf, additional_headers: Vec<String>, skip: usize) {
+fn probe(
+    url: String,
+    playbook: PathBuf,
+    additional_headers: Vec<String>,
+    skip: usize,
+    concurrency: usize,
+) {
     let client = reqwest::ClientBuilder::new()
         .default_headers(parse_headers(additional_headers))
         .build()
         .expect("Client::new()");
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
 
-    let file = File::open(&playbook).expect("Failed to open playbook file");
-    let mut reader = std::io::BufReader::new(file);
+    let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let channel_capacity = concurrency * 8;
+    let (tx, rx) = flume::bounded::<(usize, HttpRequest)>(channel_capacity);
 
-    let mut index: usize = 0;
-    // Skip first `skip` requests
-    for _ in 0..skip {
-        if read_request(&mut reader).is_err() {
-            println!("[{index}] Failed to read request while skipping first {skip} requests.");
-            return;
+    // Reader thread: reads requests from file and pushes them into the channel.
+    // Also prints progress based on approximate completed request count.
+    let reader_handle = std::thread::spawn(move || {
+        let file = File::open(&playbook).expect("Failed to open playbook file");
+        let mut reader = std::io::BufReader::new(file);
+
+        // Skip first `skip` requests
+        for i in 0..skip {
+            if read_request(&mut reader).is_err() {
+                println!("[{i}] Failed to read request while skipping first {skip} requests.");
+                return skip;
+            }
         }
-        index += 1;
-    }
 
-    let mut errors: usize = 0;
-    let mut batch_start = std::time::Instant::now();
-    while let Ok(request) = read_request(&mut reader) {
-        match rt.block_on(send_request(&client, &url, &request)) {
-            Ok(response) if response.status().is_success() => {
-                let _ = rt.block_on(response.bytes());
-            }
-            Ok(response) => {
-                errors += 1;
-                let status = response.status();
-                let body = rt.block_on(response.text()).unwrap_or_default();
-                let preview = match body.char_indices().nth(512) {
-                    Some((pos, _)) => &body[..pos],
-                    None => &body,
-                };
-                eprintln!("[{index}] {} -> {status}: {preview}", request.uri);
-                if !request.body.is_empty() {
-                    eprintln!("  request body: {}", BASE64.encode(&request.body));
-                }
-            }
-            Err(err) => {
-                errors += 1;
-                eprintln!("[{index}] {} -> connection error: {err}", request.uri);
-                if !request.body.is_empty() {
-                    eprintln!(
-                        "  base64-encoded request body: {}",
-                        BASE64.encode(&request.body)
-                    );
-                }
-                eprintln!("Aborting due to connection error");
+        let mut sent: usize = 0;
+        let mut batch_start = std::time::Instant::now();
+        let mut next_milestone: usize = skip + 1000;
+        let mut index = skip;
+        while let Ok(request) = read_request(&mut reader) {
+            if tx.send((index, request)).is_err() {
                 break;
             }
-        }
+            sent += 1;
+            index += 1;
 
-        index += 1;
-        if index.is_multiple_of(1000) {
-            let rps = 1000.0 / batch_start.elapsed().as_secs_f64();
-            println!("[{index}] {rps:.1} rps");
-            batch_start = std::time::Instant::now();
+            // Approximate completed = skip + sent - items still in channel
+            let completed = skip + sent.saturating_sub(tx.len());
+            if completed >= next_milestone {
+                let rps = (completed - skip) as f64 / batch_start.elapsed().as_secs_f64();
+                println!("[{completed}] {rps:.1} rps");
+                batch_start = std::time::Instant::now();
+                next_milestone = completed + 1000;
+            }
         }
+        index
+    });
+
+    // Error channel: workers send errors here, a dedicated task prints and tracks them
+    let (err_tx, err_rx) = flume::unbounded::<ProbeError>();
+
+    // Error reporting task: prints errors as they arrive, returns stats
+    let error_task = rt.spawn(async move {
+        let mut total_errors: usize = 0;
+        let mut connection_errors: Vec<usize> = Vec::new();
+        while let Ok(err) = err_rx.recv_async().await {
+            total_errors += 1;
+            match err {
+                ProbeError::Http {
+                    index,
+                    request,
+                    status,
+                    content_type,
+                    body,
+                } => {
+                    let is_text = content_type
+                        .as_deref()
+                        .is_some_and(|ct| ct.contains("json") || ct.contains("text"));
+                    let body_str = if is_text {
+                        String::from_utf8_lossy(&body).into_owned()
+                    } else {
+                        BASE64.encode(&body)
+                    };
+                    let preview = match body_str.char_indices().nth(512) {
+                        Some((pos, _)) => &body_str[..pos],
+                        None => &body_str,
+                    };
+                    eprintln!(
+                        "[{index}] {:?} {} -> {status}: {preview}",
+                        request.method, request.uri
+                    );
+                    log_request_details(&request);
+                }
+                ProbeError::Connection {
+                    index,
+                    request,
+                    error,
+                } => {
+                    connection_errors.push(index);
+                    eprintln!(
+                        "[{index}] {:?} {} -> connection error: {error}",
+                        request.method, request.uri
+                    );
+                    log_request_details(&request);
+                }
+            }
+        }
+        (total_errors, connection_errors)
+    });
+
+    // Spawn N async tasks that consume requests from the channel
+    let tasks: Vec<_> = std::iter::repeat_n((rx, err_tx, abort), concurrency)
+        .map(|(rx, err_tx, abort)| {
+            let client = client.clone();
+            let url = url.clone();
+            rt.spawn(async move {
+                while let Ok((index, request)) = rx.recv_async().await {
+                    if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    match send_request(&client, &url, &request).await {
+                        Ok(response) if response.status().is_success() => {
+                            let _ = response.bytes().await;
+                        }
+                        Ok(response) => {
+                            let status = response.status();
+                            let content_type = response
+                                .headers()
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| s.to_string());
+                            let body = response
+                                .bytes()
+                                .await
+                                .map(|b| b.to_vec().into_boxed_slice())
+                                .unwrap_or_default();
+                            let _ = err_tx.send(ProbeError::Http {
+                                index,
+                                request,
+                                status,
+                                content_type,
+                                body,
+                            });
+                        }
+                        Err(error) => {
+                            abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = err_tx.send(ProbeError::Connection {
+                                index,
+                                request,
+                                error,
+                            });
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for task in tasks {
+        rt.block_on(task).expect("Task panicked");
     }
 
-    let total = index - skip;
+    let (total_errors, mut connection_errors) =
+        rt.block_on(error_task).expect("Error task panicked");
+
+    if connection_errors.len() > 1 {
+        connection_errors.sort_unstable();
+        eprintln!(
+            "Got {} connection errors. Retry with --skip {} to narrow down.",
+            connection_errors.len(),
+            connection_errors[0]
+        );
+    }
+
+    let last_index = reader_handle.join().expect("Reader thread panicked");
+    let total = last_index - skip;
     println!(
-        "Probed {total} requests: {} ok, {errors} failed",
-        total.saturating_sub(errors)
+        "Probed {total} requests: {} ok, {total_errors} failed",
+        total.saturating_sub(total_errors)
     );
+}
+
+enum ProbeError {
+    Http {
+        index: usize,
+        request: HttpRequest,
+        status: reqwest::StatusCode,
+        content_type: Option<String>,
+        body: Box<[u8]>,
+    },
+    Connection {
+        index: usize,
+        request: HttpRequest,
+        error: reqwest::Error,
+    },
+}
+
+fn log_request_details(request: &HttpRequest) {
+    for header in request.headers.iter() {
+        eprintln!("  {header}");
+    }
+    if !request.body.is_empty() {
+        let is_json = request
+            .headers
+            .iter()
+            .any(|h| h.to_ascii_lowercase().contains("json"));
+        if is_json {
+            if let Ok(text) = std::str::from_utf8(&request.body) {
+                eprintln!("  body: {text}");
+            } else {
+                eprintln!("  body (base64): {}", BASE64.encode(&request.body));
+            }
+        } else {
+            eprintln!("  body (base64): {}", BASE64.encode(&request.body));
+        }
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
