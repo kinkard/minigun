@@ -1,14 +1,17 @@
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::num::{NonZero, NonZeroUsize};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Instant;
+
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use clap::{Parser, Subcommand};
 use reqwest::Method;
 use reqwest::header::{HeaderName, HeaderValue};
 use rustc_hash::FxHashMap;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::Arc;
 
 use crate::playbook_capnp::HttpMethod;
 use crate::tcpdump::HttpRequest;
@@ -58,6 +61,9 @@ enum Commands {
         /// Number of requests to skip from the beginning of the playbook.
         #[arg(short, long, default_value = "0")]
         skip: usize,
+        /// Maximum number of requests to send. If not set, all requests in the playbook are sent.
+        #[arg(short, long)]
+        limit: Option<NonZeroUsize>,
         /// Number of concurrent requests to send.
         #[arg(short, long, default_value = "1")]
         concurrency: usize,
@@ -94,8 +100,9 @@ fn main() {
             playbook,
             header,
             skip,
+            limit,
             concurrency,
-        } => probe(url, playbook, header, skip, concurrency),
+        } => probe(url, playbook, header, skip, limit, concurrency),
         Commands::Run {
             url,
             playbook,
@@ -169,6 +176,7 @@ fn probe(
     playbook: PathBuf,
     additional_headers: Vec<String>,
     skip: usize,
+    limit: Option<NonZeroUsize>,
     concurrency: usize,
 ) {
     let client = reqwest::ClientBuilder::new()
@@ -200,24 +208,24 @@ fn probe(
             }
         }
 
-        let mut sent: usize = 0;
-        let mut batch_start = std::time::Instant::now();
-        let mut next_milestone: usize = skip + 1000;
+        let mut start = Instant::now();
         let mut index = skip;
+        let limit = limit.map(NonZero::get).unwrap_or(usize::MAX);
         while let Ok(request) = read_request(&mut reader) {
+            if index - skip >= limit {
+                break;
+            }
+
             if tx.send((index, request)).is_err() {
                 break;
             }
-            sent += 1;
             index += 1;
 
-            // Approximate completed = skip + sent - items still in channel
-            let completed = skip + sent.saturating_sub(tx.len());
-            if completed >= next_milestone {
-                let rps = (completed - skip) as f64 / batch_start.elapsed().as_secs_f64();
-                println!("[{completed}] {rps:.1} rps");
-                batch_start = std::time::Instant::now();
-                next_milestone = completed + 1000;
+            if index.is_multiple_of(1000) {
+                let now = Instant::now();
+                let rps = (index - skip) as f64 / (now - start).as_secs_f64();
+                start = now;
+                println!("[{index}] {rps:.1} rps");
             }
         }
         index
@@ -435,7 +443,7 @@ async fn run(
                     .skip(task_idx)
                     .step_by(max_concurrency);
                 for r in requests {
-                    let start = std::time::Instant::now();
+                    let start = Instant::now();
                     let result = send_request(&client, &url, r).await;
 
                     let elapsed_us = start.elapsed().as_micros();
@@ -457,7 +465,7 @@ async fn run(
         if measure_cold_start {
             measure_cold_start = false;
 
-            let start = std::time::Instant::now();
+            let start = Instant::now();
             let mut successfull = 0;
             let mut total = 0;
             let mut latencies = Vec::new();
@@ -493,7 +501,7 @@ async fn run(
         }
 
         // First 15s read all results and throw them away
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         while let Ok(_latency) = results_rx.recv() {
             if start.elapsed().as_secs() >= 15 {
                 break;
@@ -501,7 +509,7 @@ async fn run(
         }
 
         // Then read the results for 15s and count the success rate, throughput and p50, p95, p99 latency
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let mut successfull = 0;
         let mut total = 0;
         let mut latencies = Vec::new();
