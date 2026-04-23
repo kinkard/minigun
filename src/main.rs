@@ -173,6 +173,7 @@ fn probe(
 ) {
     let client = reqwest::ClientBuilder::new()
         .default_headers(parse_headers(additional_headers))
+        .timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("Client::new()");
 
