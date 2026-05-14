@@ -209,6 +209,7 @@ fn probe(
         }
 
         let mut start = Instant::now();
+        let mut last_reported = skip;
         let mut index = skip;
         let limit = limit.map(NonZero::get).unwrap_or(usize::MAX);
         while let Ok(request) = read_request(&mut reader) {
@@ -223,8 +224,9 @@ fn probe(
 
             if index.is_multiple_of(1000) {
                 let now = Instant::now();
-                let rps = (index - skip) as f64 / (now - start).as_secs_f64();
+                let rps = (index - last_reported) as f64 / (now - start).as_secs_f64();
                 start = now;
+                last_reported = index;
                 println!("[{index}] {rps:.1} rps");
             }
         }
